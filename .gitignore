@@ -1,2 +1,4 @@
-*.csv
+dataset_00_sem_virg.csv
+dataset_codificado.csv
+ID_*.csv
 *.exe
