@@ -8,10 +8,12 @@
 #include <sstream>
 #include <omp.h>
 
-constexpr const char* ARQUIVO_DATASET = "dataset_00_sem_virg.csv";
-
 using namespace std;
 using Linha = vector<string>;
+
+constexpr const char* ARQUIVO_DATASET = "dataset_00_sem_virg.csv";
+constexpr const char* ARQUIVO_SAIDA   = "dataset_codificado.csv";
+constexpr int TAMANHO_CHUNK = 500000;
 
 unordered_set<string> colunasAlvo = {
     "cdtup", "berco", "portoatracacao", "mes", "tipooperacao", 
@@ -34,38 +36,47 @@ void escrever_arquivos_individuais(
     const unordered_map<string, unordered_map<string, int>>& mapas
 );
 void escrever_dataset_codificado(
-    const vector<Linha>& dados,
+    const vector<vector<string>>& chunk,
     const vector<string>& nomeColunas,
     const unordered_map<string, unordered_map<string, int>>& mapas
 );
 
 
 int main() {
-    ifstream arquivo(ARQUIVO_DATASET);
-    if (!arquivo) {
-        cerr << "Não foi possível abrir o arquivo " << ARQUIVO_DATASET << ". Verifique o local do arquivo." << endl;
-        return 1;
-    }
-
     vector<string> nomeColunas;
     vector<int> indicesAlvo;
     unordered_map<string, int> nomeParaIndice;
     
-    /* leitura do arquivo */
-    ler_cabecalho(arquivo, nomeColunas, indicesAlvo, nomeParaIndice);
-    vector<Linha> dados = ler_dados(arquivo);
-    arquivo.close();
+    /* mapas globais de valor->ID e contadores */
+    unordered_map<string, unordered_map<string, int>> mapas;
+    unordered_map<string, int> contadores;
+    
+    /* PASSO 1: leitura do arquivo */
+    ifstream arquivo_entrada(ARQUIVO_DATASET);
+    ofstream arquivo_saida(ARQUIVO_SAIDA);
+    if (!arquivo_entrada || !arquivo_saida) {
+        cerr << "Não foi possível abrir o arquivo " << ARQUIVO_DATASET << "ou" << ARQUIVO_SAIDA << ". Verifique o local do arquivo." << endl;
+        return 1;
+    }
+    ler_cabecalho(arquivo_entrada, nomeColunas, indicesAlvo, nomeParaIndice);
+    for (size_t i = 0; i < nomeColunas.size(); ++i) {
+        arquivo_saida << nomeColunas[i] << (i + 1 < nomeColunas.size() ? ',' : '\n');
+    }
 
     double inicio = omp_get_wtime();
 
-    /* mapeamento das colunas */
-    unordered_map<string, unordered_map<string, int>> mapas;
-    unordered_map<string, int> contadores;
+    /* PASSO 2: construir os mapas */
+    while(true) {
+        auto chunk = ler_dados(arquivo_entrada);
+        if (chunk.empty()) break;
+        gerar_mapas_codificacao(chunk, nomeColunas, indicesAlvo, mapas, contadores);
+        escrever_dataset_codificado(chunk, nomeColunas, mapas);
+    } 
+    arquivo_entrada.close();
 
-    /* criação dos arquivos de codificação */
-    gerar_mapas_codificacao(dados, nomeColunas, indicesAlvo, mapas, contadores);
+    /* criação dos arquivos de codificação (indv, geral) */
     escrever_arquivos_individuais(indicesAlvo, nomeColunas, mapas);
-    escrever_dataset_codificado(dados, nomeColunas, mapas);
+    //escrever_dataset_codificado(nomeColunas, mapas);
 
     double fim = omp_get_wtime();
     cout << (fim - inicio) << " segundos" << endl;
@@ -76,7 +87,6 @@ int main() {
 void ler_cabecalho(ifstream& arquivo, vector<string>& nomeColunas, vector<int>& indicesAlvo, unordered_map<string, int>& nomeParaIndice) {
     string cabecalho;
     getline(arquivo, cabecalho);
-
     stringstream streamCabecalho(cabecalho);
     string coluna;
     int idx = 0;
@@ -110,23 +120,25 @@ vector<Linha> ler_dados(ifstream& arquivo) {
 }
 
 void gerar_mapas_codificacao(
-    const vector<Linha>& dados,
+    const vector<Linha>& chunk,
     const vector<string>& nomeColunas,
     const vector<int>& indicesAlvo,
-    unordered_map<string, unordered_map<string, int>>& mapas,
-    unordered_map<string, int>& contadores
+    unordered_map<string, unordered_map<string, int>>& mapasGlobais,
+    unordered_map<string, int>& contadoresGlobais
 ) {
-    #pragma omp parallel for
-    for (int i = 0; i < indicesAlvo.size(); i++) 
+    /* pra cada colunaAlvo, é paralelizado a construção de um mapa local */
+    #pragma omp parallel for schedule(dynamic, 1)
+    for (size_t i = 0; i < indicesAlvo.size(); i++) 
     {
         int col = indicesAlvo[i];
-        string nomeCol = nomeColunas[col];
-        unordered_map<string, int> mapaLocal;
-        int prox_id = 0;
+        const string& nomeCol = nomeColunas[col];
 
-        for (const auto &linha : dados)
+        unordered_map<string, int> mapaLocal; /* mapa local por thread */
+        int prox_id = 1;
+
+        for (const auto &linha : chunk)
         {
-            string valor = linha[col];
+            const string& valor = linha[col];
             if (!mapaLocal.count(valor))
             {
                 mapaLocal[valor] = prox_id++;
@@ -135,9 +147,15 @@ void gerar_mapas_codificacao(
 
         #pragma omp critical
         {
-            mapas[nomeCol] = mapaLocal;
+            auto& mapaGlobal = mapasGlobais[nomeCol];
+            auto& contadorGlobal = contadoresGlobais[nomeCol];
+            for (auto& par : mapaLocal) 
+            {
+                if (!mapaGlobal.count(par.first)) {
+                    mapaGlobal[par.first] = contadorGlobal++;
+                }
+            }
         }
-        contadores[nomeCol] = prox_id;
     }
 }
 
@@ -163,20 +181,20 @@ void escrever_arquivos_individuais(
 }
 
 void escrever_dataset_codificado(
-    const vector<Linha>& dados,
+    const vector<vector<string>>& chunk,
     const vector<string>& nomeColunas,
     const unordered_map<string, unordered_map<string, int>>& mapas
 ) 
 {
-    vector<string> linhasProntas(dados.size());
+    vector<string> linhasProntas(chunk.size());
 
-    #pragma omp parallel for
-    for (int i = 0; i < dados.size(); i++)
+    #pragma omp parallel for schedule(dynamic, TAMANHO_CHUNK)
+    for (int i = 0; i < chunk.size(); i++)
     {
         stringstream ss;
-        for (size_t j = 0; j < dados[i].size(); j++)
+        for (size_t j = 0; j < chunk[i].size(); j++)
         {
-            const string &valor = dados[i][j];
+            const string &valor = chunk[i][j];
             if (mapas.count(nomeColunas[j]))
             {
                 ss << mapas.at(nomeColunas[j]).at(valor);
@@ -185,12 +203,12 @@ void escrever_dataset_codificado(
             {
                 ss << valor;
             }
-            if (j < dados[i].size() - 1)
+            if (j < chunk[i].size() - 1)
                 ss << ",";
         }
         linhasProntas[i] = ss.str();
     }
-    ofstream arquivoCodificado("dataset_codificado.csv");
+    ofstream arquivoCodificado(ARQUIVO_SAIDA);
 
     for (size_t i = 0; i < nomeColunas.size(); i++) 
     {
